@@ -7,6 +7,8 @@ import (
 
 	"github.com/go-fuego/fuego"
 	"github.com/gorilla/securecookie"
+	"golang.org/x/oauth2"
+	"golang.org/x/oauth2/spotify"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 )
@@ -42,6 +44,12 @@ func main() {
 		SteamClient:      steamClient,
 		TelegramBotToken: os.Getenv("TELEGRAM_BOT_TOKEN"),
 		SecureCookie:     securecookie.New([]byte("42D794DD9F6F8390465D2454E75B542D"), []byte("42D794DD9F6F8390465D2454E75B542D")),
+		SpotifyOauthConfig: oauth2.Config{
+			ClientID:     os.Getenv("SPOTIFY_CLIENT_ID"),
+			ClientSecret: os.Getenv("SPOTIFY_CLIENT_SECRET"),
+			Scopes:       []string{"user-read-private", "playlist-read-private"},
+			Endpoint:     spotify.Endpoint,
+		},
 	}
 	r.RegisterRoutes(s)
 

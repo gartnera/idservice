@@ -13,26 +13,31 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-fuego/fuego"
 	"github.com/gorilla/securecookie"
 	"github.com/lithammer/shortuuid"
 	"github.com/yohcop/openid-go"
+	"golang.org/x/oauth2"
+	"golang.org/x/sync/errgroup"
 	"gorm.io/gorm"
 )
 
 const (
-	steamOpenID      = "https://steamcommunity.com/openid"
-	steamCallbackUrl = "/login/steam/callback"
-	profileUrl       = "/profile"
+	steamOpenID        = "https://steamcommunity.com/openid"
+	steamCallbackUrl   = "/login/steam/callback"
+	profileUrl         = "/profile"
+	spotifyCallbackUrl = "/login/spotify/callback"
 )
 
 type routes struct {
-	DB               *gorm.DB
-	SteamClient      SteamClient
-	TelegramBotToken string
-	SecureCookie     *securecookie.SecureCookie
+	DB                 *gorm.DB
+	SteamClient        SteamClient
+	TelegramBotToken   string
+	SecureCookie       *securecookie.SecureCookie
+	SpotifyOauthConfig oauth2.Config
 }
 
 func (r *routes) RegisterRoutes(s *fuego.Server) {
@@ -42,6 +47,8 @@ func (r *routes) RegisterRoutes(s *fuego.Server) {
 	fuego.Post(s, "/login/steam", r.LoginSteam)
 	fuego.Get(s, steamCallbackUrl, r.LoginSteamCallback)
 	fuego.Get(s, "/login/telegram/callback", r.LoginTelegramCallback)
+	fuego.Get(s, "/login/spotify", r.LoginSpotify)
+	fuego.Get(s, "/login/spotify/callback", r.LoginSpotifyCallback)
 	fuego.Get(s, "/logout", r.Logout)
 
 	fuego.Get(s, profileUrl, r.Profile)
@@ -81,7 +88,7 @@ func (r *routes) setLoginUidCookie(c *fuego.ContextNoBody, uid string) (any, err
 		Path:     "/",
 		HttpOnly: true,
 	})
-	return c.Redirect(http.StatusFound, profileUrl)
+	return c.Redirect(http.StatusTemporaryRedirect, profileUrl)
 }
 
 func (r *routes) getLoginUidCookie(c *fuego.ContextNoBody) (string, error) {
@@ -115,7 +122,7 @@ func (r *routes) LoginSteam(c *fuego.ContextNoBody) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	return c.Redirect(http.StatusFound, url)
+	return c.Redirect(http.StatusTemporaryRedirect, url)
 }
 
 func (r *routes) LoginSteamCallback(c *fuego.ContextNoBody) (any, error) {
@@ -305,6 +312,228 @@ func (r *routes) LoginTelegramCallback(c *fuego.ContextNoBody) (any, error) {
 	return r.setLoginUidCookie(c, userId)
 }
 
+func (r *routes) LoginSpotify(c *fuego.ContextNoBody) (any, error) {
+	if r.SpotifyOauthConfig.RedirectURL == "" {
+		r.SpotifyOauthConfig.RedirectURL = calcCallbackUrl(c, spotifyCallbackUrl)
+	}
+	url := r.SpotifyOauthConfig.AuthCodeURL("")
+	return c.Redirect(http.StatusPermanentRedirect, url)
+}
+
+const spotifyPlaylistsURL = "https://api.spotify.com/v1/me/playlists?limit=50"
+
+type PlaylistResponse struct {
+	Href     string         `json:"href"`
+	Limit    int            `json:"limit"`
+	Next     string         `json:"next"`
+	Offset   int            `json:"offset"`
+	Previous string         `json:"previous"`
+	Total    int            `json:"total"`
+	Items    []PlaylistItem `json:"items"`
+}
+
+type PlaylistOwner struct {
+	ID string `json:"id"`
+}
+
+type PlaylistItem struct {
+	ID          string        `json:"id"`
+	Name        string        `json:"name"`
+	Description string        `json:"description"`
+	Owner       PlaylistOwner `json:"owner"`
+	URI         string        `json:"uri"`
+}
+
+type SpotifyPlaylistTracks struct {
+	Items []struct {
+		AddedAt time.Time `json:"added_at"`
+		AddedBy struct {
+			ExternalUrls struct {
+				Spotify string `json:"spotify"`
+			} `json:"external_urls"`
+			Href string `json:"href"`
+			ID   string `json:"id"`
+			Type string `json:"type"`
+			URI  string `json:"uri"`
+		} `json:"added_by"`
+	} `json:"items"`
+}
+
+func getSpotifyPlaylists(client *http.Client, url string) (*PlaylistResponse, error) {
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("API error: %s", resp.Status)
+	}
+
+	var playlistResponse PlaylistResponse
+	if err := json.NewDecoder(resp.Body).Decode(&playlistResponse); err != nil {
+		return nil, err
+	}
+
+	return &playlistResponse, nil
+}
+
+func getSpotifyPlaylistTracks(client *http.Client, id string) (*SpotifyPlaylistTracks, error) {
+	// note: this is missing pagination
+	url := fmt.Sprintf("https://api.spotify.com/v1/playlists/%s/tracks?limit=50&items(added_by,added_at)", id)
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	playlistTracks := &SpotifyPlaylistTracks{}
+	if err := json.NewDecoder(resp.Body).Decode(&playlistTracks); err != nil {
+		return nil, err
+	}
+	return playlistTracks, nil
+}
+
+func getSpotifyMinimumPlaylistTime(client *http.Client, userID string) (*time.Time, error) {
+	nextURL := spotifyPlaylistsURL
+
+	minTime := time.Now()
+	minTimeLock := sync.RWMutex{}
+	eg := errgroup.Group{}
+	eg.SetLimit(6)
+	for nextURL != "" {
+		playlistResponse, err := getSpotifyPlaylists(client, nextURL)
+		if err != nil {
+			return nil, err
+		}
+
+		for _, playlist := range playlistResponse.Items {
+			if playlist.Owner.ID != userID {
+				continue
+			}
+			playlist := playlist
+			eg.Go(func() error {
+				playlistTracks, err := getSpotifyPlaylistTracks(client, playlist.ID)
+				if err != nil {
+					return fmt.Errorf("get spotify playlist tracks: %w", err)
+				}
+				for _, track := range playlistTracks.Items {
+					if track.AddedBy.ID != userID {
+						continue
+					}
+					addedAt := track.AddedAt
+					if addedAt.IsZero() {
+						continue
+					}
+					minTimeLock.RLock()
+
+					shouldUpdate := addedAt.Before(minTime)
+					minTimeLock.RUnlock()
+					if !shouldUpdate {
+						continue
+					}
+					minTimeLock.Lock()
+					minTime = addedAt
+					minTimeLock.Unlock()
+				}
+				return nil
+			})
+
+		}
+
+		nextURL = playlistResponse.Next
+	}
+	err := eg.Wait()
+	return &minTime, err
+}
+
+type SpotifyUserInfo struct {
+	Country     string `json:"country"`
+	DisplayName string `json:"display_name"`
+	Href        string `json:"href"`
+	ID          string `json:"id"`
+	Product     string `json:"product"`
+	Type        string `json:"type"`
+	URI         string `json:"uri"`
+}
+
+func (r *routes) LoginSpotifyCallback(c *fuego.ContextNoBody) (any, error) {
+	code := c.QueryParam("code")
+	if r.SpotifyOauthConfig.RedirectURL == "" {
+		r.SpotifyOauthConfig.RedirectURL = calcCallbackUrl(c, spotifyCallbackUrl)
+	}
+	token, err := r.SpotifyOauthConfig.Exchange(c.Context(), code)
+	if err != nil {
+		c.Response().WriteHeader(http.StatusBadRequest)
+		return renderLoginFailed(fmt.Errorf("verifying callback: %w", err)), nil
+	}
+
+	client := r.SpotifyOauthConfig.Client(c.Context(), token)
+	userInfoResp, err := client.Get("https://api.spotify.com/v1/me")
+	if err != nil {
+		c.Response().WriteHeader(http.StatusBadRequest)
+		return renderLoginFailed(fmt.Errorf("getting user info: %w", err)), nil
+	}
+	defer userInfoResp.Body.Close()
+
+	var userInfo SpotifyUserInfo
+	if err := json.NewDecoder(userInfoResp.Body).Decode(&userInfo); err != nil {
+		c.Response().WriteHeader(http.StatusBadRequest)
+		return renderLoginFailed(fmt.Errorf("decoding user info: %w", err)), nil
+	}
+
+	idHashBytes := sha256.Sum256([]byte(userInfo.ID))
+	idHash := hex.EncodeToString(idHashBytes[:])
+	currentUid, currentUidErr := r.getLoginUidCookie(c)
+
+	challengeRecord := &ChallengeRecord{}
+	r.DB.First(&challengeRecord, "service = 'spotify' AND service_id_hash = ?", idHash)
+	if challengeRecord.UserID != "" {
+		log.Printf("found existing spotify user %s", challengeRecord.UserID)
+		if currentUidErr == nil && challengeRecord.UserID != currentUid {
+			c.Response().WriteHeader(http.StatusBadRequest)
+			return renderLoginFailed(fmt.Errorf("account already linked")), nil
+		}
+		return r.setLoginUidCookie(c, challengeRecord.UserID)
+	}
+
+	minTime, err := getSpotifyMinimumPlaylistTime(client, userInfo.ID)
+	if err != nil {
+		c.Response().WriteHeader(http.StatusBadRequest)
+		return renderLoginFailed(fmt.Errorf("get minimum playlist time: %w", err)), nil
+	}
+	log.Printf("got spotify minimum time: %v", minTime)
+
+	userId := currentUid
+	if currentUidErr != nil {
+		userId = shortuuid.New()
+	}
+
+	isPremium := userInfo.Product == "premium"
+
+	challengeRecord = &ChallengeRecord{
+		UserID:         userId,
+		CreatedAt:      time.Now(),
+		ServiceCreated: *minTime,
+		Service:        "spotify",
+		ServiceIDHash:  idHash,
+		IsPremium:      isPremium,
+	}
+	r.DB.Create(challengeRecord)
+
+	return r.setLoginUidCookie(c, userId)
+}
+
 func (r *routes) Logout(c *fuego.ContextNoBody) (any, error) {
 	// expire uid cookie
 	c.SetCookie(http.Cookie{
@@ -314,7 +543,7 @@ func (r *routes) Logout(c *fuego.ContextNoBody) (any, error) {
 		HttpOnly: true,
 		Expires:  time.Now().Add(-time.Hour),
 	})
-	return c.Redirect(http.StatusFound, "/")
+	return c.Redirect(http.StatusTemporaryRedirect, "/")
 }
 
 type ProfileResponse struct {
@@ -325,7 +554,7 @@ type ProfileResponse struct {
 func (r *routes) Profile(c *fuego.ContextNoBody) (*DataOrTemplate[ProfileResponse], error) {
 	uid, err := r.getLoginUidCookie(c)
 	if err != nil {
-		c.Redirect(http.StatusFound, "/")
+		c.Redirect(http.StatusTemporaryRedirect, "/")
 		return nil, err
 	}
 	resp := ProfileResponse{

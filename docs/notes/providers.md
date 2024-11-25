@@ -51,6 +51,17 @@ IDs from both my accounts (redacted):
 
 API [user object](https://developer.x.com/en/docs/x-api/users/lookup/api-reference/get-users-id) contains `created_at`. Use verified as premium status.
 
+### Spotify
+
+| Phone Number Verification | Account Age | Premium Status |
+|---------------------------|-------------|----------------|
+|❌                         |✅           |✅              |
+
+
+API [user object](https://developer.spotify.com/documentation/web-api/reference/get-current-users-profile) `product` field is the premium status.
+
+Account age isn't obvious, but could be derived by getting minimum of `added_at` field from tracks in playlists.
+
 ### Github
 
 | Phone Number Verification | Account Age | Premium Status |

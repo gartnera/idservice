@@ -44,7 +44,7 @@ func renderHome() fuego.Gomponent {
 		H1(Text("Profile Challenges")),
 		Div(
 			P((Text("This application allows you to demonstrate trustworthiness by completing challenges."))),
-			P((Text("We preserve your privacy by only storing a hash of your information."))),
+			P((Text("We preserve your privacy by only storing a hash of your information. You may remove any access granted after the initial login."))),
 		),
 		Div(
 			H2(Text("Get Started")),
@@ -69,6 +69,15 @@ func renderHome() fuego.Gomponent {
 			H3(Text("Telegram")),
 			P(Text("You must grant access to send messages if you'd like your premium status to be verified.")),
 			Raw(`<script async src="https://telegram.org/js/telegram-widget.js?22" data-telegram-login="agartner_test_bot" data-size="large" data-auth-url="https://pc.t.agartner.com/login/telegram/callback" data-request-access="write"></script>`),
+			H3(Text("Spotify")),
+			Form(
+				Action("/login/spotify"),
+				Method("get"),
+				Button(
+					Type("submit"),
+					Text("Login with Spotify"),
+				),
+			),
 		),
 	)
 }
